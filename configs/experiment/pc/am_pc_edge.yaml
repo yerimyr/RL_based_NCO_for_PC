@@ -1,0 +1,52 @@
+# @package _global_
+
+defaults:
+  - override /model: am_pc_edge.yaml
+  - override /env: pc.yaml
+  - override /callbacks: default.yaml
+  - override /trainer: default.yaml
+  - override /logger: tensorboard.yaml
+
+model:
+  generate_default_data: false
+  batch_size: 128
+  val_batch_size: 128
+  test_batch_size: 128
+  train_data_size: 10000
+  val_data_size: 100
+  test_data_size: 100
+  optimizer_kwargs:
+    lr: 1e-4
+    weight_decay: 1e-6
+
+curriculum:
+  enabled: true
+  gammas: [0, 0.25, 0.5, 0.75, 1]
+  later_stage_lr: 1e-5
+
+hydra:
+  run:
+    dir: ${paths.log_dir}/train/curriculum/${now:%Y-%m-%d}_${now:%H-%M-%S}
+
+trainer:
+  max_epochs: 100
+  check_val_every_n_epoch: 1
+  enable_progress_bar: false
+  enable_model_summary: false
+
+callbacks:
+  rich_progress_bar: null
+  model_summary: null
+  tensorboard_logger:
+    _target_: rl4co.utils.callbacks.tensorboard_logger.TensorBoardLogger
+    train_metrics: ["reward", "loss", "entropy", "log_likelihood"]
+    val_metrics: ["reward", "loss", "log_likelihood", "sampling_reward"]
+    test_metrics: ["reward"]
+    train_decode_check: true
+  nco_test_result_writer:
+    _target_: rl4co.utils.callbacks.nco_test_result_writer.NCOTestResultWriter
+    output_dir: ${paths.output_dir}/test_results
+    filename: nco_test_results.csv
+    algorithm: reinforce_edge_no_compat_no_mask
+
+seed: 1234

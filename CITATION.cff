@@ -1,0 +1,7 @@
+cff-version: 1.2.0
+message: "If you use this research code, please cite this software."
+title: "Reinforcement Learning-Based Neural Combinatorial Optimization for Part Consolidation under Manufacturing Constraints"
+type: software
+authors:
+  - family-names: Ji
+    given-names: Yerim
