@@ -51,6 +51,26 @@ python evaluate_pc.py --algorithms nco --auto-ckpt --device cpu
 
 `--auto-ckpt` picks the most recently modified best Stage 3 checkpoint. Use `--ckpt` to evaluate a specific run or γ.
 
+## Reproduce the paper benchmark
+
+After training all five policies, run:
+
+```powershell
+python evaluate_pc.py --paper-run-root logs/train/curriculum/paper_reproduction --device cpu
+```
+
+The benchmark compares CP-SAT, CPCCD, MCL, and NCO on the same 100 instances in each test range (10–20, 21–30, 31–40, and the unseen 41–50). It reuses or generates the fixed range datasets with seed 1234. For each γ, it loads that γ's best Stage 3 checkpoint and scores every method with the same objective. CP-SAT uses one worker and a 300-second limit per instance by default, so the full run can take substantial time.
+
+After each completed condition, `outputs/paper_evaluation/` contains instance-level results and a summary of scores, group counts, feasibility, and runtimes. With all four methods and at least two instances, it also contains paired Friedman tests and two-sided Wilcoxon tests with Holm adjustment across the six pairs in each condition. CP-SAT status and whether it returned a solution are recorded separately. If there is no solver solution, the score is for the solver wrapper's fallback partition.
+
+For a quick check after training γ = 0.5:
+
+```powershell
+python evaluate_pc.py --paper-run-root logs/train/curriculum/paper_reproduction --ranges 10-20 --gammas 0.5 --limit 2 --ortools-time-limit 2 --device cpu --paper-output-dir outputs/paper_smoke
+```
+
+For a custom dataset, use `--data`, `--gamma`, and `--ckpt` explicitly. For example, `--algorithms ortools,cpccd,mcl,nco` compares all four methods in one CSV.
+
 ## Repository Structure
 
 ```text

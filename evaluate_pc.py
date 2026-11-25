@@ -6,21 +6,26 @@ import json
 import random
 import time
 from collections import defaultdict
+from itertools import combinations
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 
-from rl4co.data.utils import load_npz_to_tensordict
+from generate_pc_datasets import DEFAULT_PARAMS as PC_DATASET_PARAMS
+from rl4co.data.utils import load_npz_to_tensordict, save_tensordict_to_npz
 from rl4co.envs.pc.env import PartConsolidationEnv
-from rl4co.envs.pc.evaluator import evaluate_groups, score_metric_rows
+from rl4co.envs.pc.evaluator import DEFAULT_MODULARITY_GAMMA, evaluate_groups, score_metric_rows
 from rl4co.models.zoo.am import AttentionModel
 from rl4co.utils.ops import unbatchify
 
 
 DEFAULT_DATA = Path("data/pc/pc20_newdist_test_seed1234.npz")  # 1234
 DEFAULT_CKPT_ROOT = Path("logs/train/curriculum")
+PAPER_ALGORITHMS = ("ortools", "cpccd", "mcl", "nco")
+PAPER_RANGES = ("10-20", "21-30", "31-40", "41-50")
+PAPER_GAMMAS = (0.0, 0.25, 0.5, 0.75, 1.0)
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,8 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--algorithms",
         type=str,
-        default="cpccd,mcl",
-        help="Comma-separated list from: cpccd, mcl, nco.",
+        help="Comma-separated list from: ortools, cpccd, mcl, nco.",
     )
     parser.add_argument(
         "--limit",
@@ -42,6 +46,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--output", type=Path, default=Path("baseline_results.csv"))
+    parser.add_argument("--gamma", type=float, default=DEFAULT_MODULARITY_GAMMA)
+    parser.add_argument("--ortools-time-limit", type=float, default=300.0)
+    parser.add_argument("--ortools-workers", type=int, default=1)
+    parser.add_argument("--paper-run-root", type=Path, help="Run the paper benchmark using this curriculum run.")
+    parser.add_argument("--paper-output-dir", type=Path, default=Path("outputs/paper_evaluation"))
+    parser.add_argument("--ranges", nargs="+", choices=PAPER_RANGES, default=PAPER_RANGES)
+    parser.add_argument("--gammas", nargs="+", type=float, choices=PAPER_GAMMAS, default=PAPER_GAMMAS)
     parser.add_argument(
         "--ckpt",
         type=Path,
@@ -61,7 +72,7 @@ def parse_args() -> argparse.Namespace:
         choices=("auto", "cpu", "cuda"),
         help="Device for NCO evaluation.",
     )
-    parser.add_argument("--nco-batch-size", type=int, default=256)
+    parser.add_argument("--nco-batch-size", type=int, help="Defaults to 100 in paper mode, 256 otherwise.")
 
     parser.add_argument("--mcl-expansion", type=int, default=2)
     parser.add_argument("--mcl-inflation", type=float, default=2.0)
@@ -162,6 +173,14 @@ def strip_sep_instance(td_item: Any) -> dict[str, Any]:
 
 def make_solver(name: str, args: argparse.Namespace, seed: int) -> Any:
     name = name.lower()
+    if name == "ortools":
+        from baseline.ortools_pc_solver import ORToolsPCSolver
+
+        return ORToolsPCSolver(
+            gamma=args.gamma,
+            time_limit_sec=args.ortools_time_limit,
+            num_workers=args.ortools_workers,
+        )
     if name == "cpccd":
         from baseline.cpccd_solver import CPCCDSolver
 
@@ -179,15 +198,17 @@ def make_solver(name: str, args: argparse.Namespace, seed: int) -> Any:
     raise ValueError(f"Unknown algorithm: {name}")
 
 
-def make_env_from_dataset(dataset: Any, device: torch.device) -> PartConsolidationEnv:
+def make_env_from_dataset(dataset: Any, device: torch.device, gamma: float) -> PartConsolidationEnv:
     sample = dataset[0]
     generator_params = {
-        "num_parts": int(scalar(sample["num_parts"])),
+        "num_parts": dataset["valid_part_mask"].shape[-1] - 1,
         "material_types": int(scalar(sample["material_type_count"]))
         if "material_type_count" in sample.keys()
         else 3,
     }
-    return PartConsolidationEnv(generator_params=generator_params, device=str(device))
+    return PartConsolidationEnv(
+        generator_params=generator_params, device=str(device), modularity_gamma=gamma
+    )
 
 
 def load_nco_model(ckpt_path: Path, env: PartConsolidationEnv, device: torch.device):
@@ -250,14 +271,19 @@ def evaluate_algorithm(
         solver = make_solver(name, args, seed)
 
         started = time.perf_counter()
-        groups, solver_elapsed = solver.solve(inst)
+        if name == "ortools":
+            result = solver.solve_with_status(inst)
+            groups, solver_elapsed = result.groups, result.elapsed_sec
+        else:
+            groups, solver_elapsed = solver.solve(inst)
         wall_elapsed = time.perf_counter() - started
 
-        metrics = score_metric_rows([evaluate_groups(groups, inst)])[0]
+        metrics = score_metric_rows([evaluate_groups(groups, inst, gamma=args.gamma)])[0]
         score = metrics["score"]
 
         row = {
             "algorithm": name,
+            "gamma": args.gamma,
             "instance_idx": idx,
             "score": float(score),
             "reward": float(score),
@@ -265,6 +291,13 @@ def evaluate_algorithm(
             "wall_elapsed_sec": float(wall_elapsed),
             "groups": json.dumps(groups),
         }
+        if name == "ortools":
+            row.update(
+                solver_status=result.status,
+                solver_has_solution=result.status in {"OPTIMAL", "FEASIBLE", "ZERO_WEIGHT"},
+                ortools_objective_value=result.objective_value,
+                ortools_best_objective_bound=result.best_objective_bound,
+            )
         if name.lower() == "mcl":
             row.update(
                 {
@@ -324,7 +357,7 @@ def evaluate_nco(
         raise FileNotFoundError(f"NCO checkpoint not found: {ckpt_path}")
 
     device = resolve_device(args.device)
-    env = make_env_from_dataset(dataset, device)
+    env = make_env_from_dataset(dataset, device, args.gamma)
     model, model_kind = load_nco_model(ckpt_path, env, device)
     num_starts = int(getattr(model, "num_starts", 0) or 0)
 
@@ -338,12 +371,16 @@ def evaluate_nco(
         batch = dataset[start:end].to(device)
         td = env.reset(batch)
 
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
         started = time.perf_counter()
         with torch.no_grad():
             if num_starts > 1:
                 out = model.policy(td.clone(), env, phase="test", num_starts=num_starts)
             else:
                 out = model.policy(td.clone(), env, phase="test")
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
         wall_elapsed = time.perf_counter() - started
 
         actions, model_reward = select_nco_actions(out, num_starts)
@@ -355,10 +392,11 @@ def evaluate_nco(
             idx = start + local_idx
             inst = strip_sep_instance(dataset[idx])
             groups = node_groups_to_part_groups(groups_with_sep)
-            metrics = score_metric_rows([evaluate_groups(groups, inst)])[0]
+            metrics = score_metric_rows([evaluate_groups(groups, inst, gamma=args.gamma)])[0]
             score = metrics["score"]
             row = {
                 "algorithm": "nco",
+                "gamma": args.gamma,
                 "instance_idx": idx,
                 "score": float(score),
                 "reward": float(score),
@@ -392,8 +430,8 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "wall_elapsed_sec",
         "groups",
     ]
-    extra = sorted({key for row in rows for key in row.keys()} - set(preferred))
-    fieldnames = [key for key in preferred if key in rows[0]] + extra
+    keys = {key for row in rows for key in row}
+    fieldnames = [key for key in preferred if key in keys] + sorted(keys - set(preferred))
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
@@ -422,11 +460,142 @@ def print_summary(rows: list[dict[str, Any]]) -> None:
         )
 
 
+def evaluate_algorithms(dataset, limit, args, algorithms):
+    rows = []
+    for name in algorithms:
+        print(f"\nRunning {name}...")
+        if name == "nco":
+            rows.extend(evaluate_nco(dataset, limit, args))
+        else:
+            rows.extend(evaluate_algorithm(name, dataset, limit, args))
+    return rows
+
+
+def load_paper_dataset(test_range: str, seed: int):
+    low, high = map(int, test_range.split("-"))
+    path = Path("data/pc") / f"pc{test_range}_newdist_test100_seed{seed}.npz"
+    if not path.exists():
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(seed)
+            env = PartConsolidationEnv(
+                generator_params={**PC_DATASET_PARAMS, "num_parts": low, "max_num_parts": high}
+            )
+            dataset = env.generator(100)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        save_tensordict_to_npz(dataset, path)
+        print(f"Generated fixed test dataset: {path}")
+    dataset = load_npz_to_tensordict(path)
+    sizes = dataset["num_parts"]
+    if dataset.batch_size[0] != 100 or not ((sizes >= low) & (sizes <= high)).all():
+        raise ValueError(f"Expected 100 instances in the range {test_range}: {path}")
+    return dataset
+
+
+def summarize_condition(rows, condition):
+    import pandas as pd
+    from scipy.stats import friedmanchisquare, wilcoxon
+
+    frame = pd.DataFrame(rows)
+    summary = frame.groupby("algorithm", sort=False).agg(
+        n=("score", "size"),
+        score_mean=("score", "mean"),
+        score_std=("score", "std"),
+        num_groups_mean=("num_groups", "mean"),
+        feasible_rate=("feasible", "mean"),
+        wall_elapsed_sec_mean=("wall_elapsed_sec", "mean"),
+    )
+    summary_rows = [
+        {**condition, "algorithm": algorithm, **metrics}
+        for algorithm, metrics in summary.to_dict("index").items()
+    ]
+    paired = frame.pivot(index="instance_idx", columns="algorithm", values="score")
+    if len(paired) < 2 or not set(PAPER_ALGORITHMS).issubset(paired.columns):
+        return summary_rows, [], []
+    scores = paired[list(PAPER_ALGORITHMS)].to_numpy()
+    if np.all(scores == scores[:, :1]):
+        omnibus_statistic, omnibus_p = 0.0, 1.0
+    else:
+        omnibus_statistic, omnibus_p = friedmanchisquare(*scores.T)
+    friedman_rows = [{
+        **condition,
+        "n": len(paired),
+        "friedman_statistic": omnibus_statistic,
+        "friedman_p": omnibus_p,
+    }]
+    pairwise = []
+    for a, b in combinations(PAPER_ALGORITHMS, 2):
+        differences = (paired[a] - paired[b]).to_numpy(copy=True)
+        differences[np.isclose(differences, 0.0, atol=1e-10)] = 0.0
+        statistic, p = wilcoxon(differences) if differences.any() else (0.0, 1.0)
+        pairwise.append({
+            **condition,
+            "algorithm_a": a,
+            "algorithm_b": b,
+            "n": len(paired),
+            "mean_difference_a_minus_b": float(differences.mean()),
+            "wilcoxon_statistic": statistic,
+            "wilcoxon_p": p,
+        })
+    adjusted = 0.0
+    for i, row in enumerate(sorted(pairwise, key=lambda row: row["wilcoxon_p"])):
+        adjusted = max(adjusted, min(1.0, (len(pairwise) - i) * row["wilcoxon_p"]))
+        row["wilcoxon_p_holm"] = adjusted
+        row["significant_at_0_05"] = bool(omnibus_p < 0.05 and adjusted < 0.05)
+    return summary_rows, friedman_rows, pairwise
+
+
+def run_paper_benchmark(args, algorithms):
+    checkpoints = {}
+    if "nco" in algorithms:
+        for gamma in args.gammas:
+            label = f"{gamma:g}".replace(".", "p")
+            stage = args.paper_run_root / f"gamma_{label}" / "stage3_n10-40" / "checkpoints"
+            candidates = sorted(stage.glob("epoch_*.ckpt"), key=lambda p: p.stat().st_mtime)
+            if not candidates:
+                raise FileNotFoundError(f"No best Stage 3 checkpoint found in {stage}")
+            checkpoints[gamma] = candidates[-1]
+
+    output = args.paper_output_dir
+    output.mkdir(parents=True, exist_ok=False)
+    raw, summaries, friedman, pairwise = [], [], [], []
+    for test_range in dict.fromkeys(args.ranges):
+        dataset = load_paper_dataset(test_range, args.seed)
+        limit = min(args.limit, len(dataset)) if args.limit > 0 else len(dataset)
+        for gamma in dict.fromkeys(args.gammas):
+            print(f"\nTest range {test_range}, gamma={gamma:g}, instances={limit}", flush=True)
+            condition = {"test_range": test_range, "gamma": gamma}
+            condition_args = argparse.Namespace(**vars(args))
+            condition_args.gamma = gamma
+            condition_args.ckpt = checkpoints.get(gamma)
+            rows = evaluate_algorithms(dataset, limit, condition_args, algorithms)
+            raw.extend({**row, **condition} for row in rows)
+            summary_rows, friedman_rows, pairwise_rows = summarize_condition(rows, condition)
+            summaries.extend(summary_rows)
+            friedman.extend(friedman_rows)
+            pairwise.extend(pairwise_rows)
+            write_csv(output / "raw_results.csv", raw)
+            write_csv(output / "summary.csv", summaries)
+            write_csv(output / "friedman_tests.csv", friedman)
+            write_csv(output / "pairwise_wilcoxon_holm.csv", pairwise)
+    print(f"\nSaved paper benchmark results to: {output}")
+
+
 def main() -> None:
     args = parse_args()
-    algorithms = [item.strip().lower() for item in args.algorithms.split(",") if item.strip()]
-    if not algorithms:
-        raise ValueError("At least one algorithm must be selected.")
+    if args.nco_batch_size is None:
+        args.nco_batch_size = 100 if args.paper_run_root else 256
+    defaults = PAPER_ALGORITHMS if args.paper_run_root else ("cpccd", "mcl")
+    algorithms = (
+        list(dict.fromkeys(item.strip().lower() for item in args.algorithms.split(",") if item.strip()))
+        if args.algorithms is not None else list(defaults)
+    )
+    if not algorithms or set(algorithms) - set(PAPER_ALGORITHMS):
+        raise ValueError(f"Select algorithms from: {', '.join(PAPER_ALGORITHMS)}")
+    if args.nco_batch_size < 1 or args.ortools_workers < 1 or args.ortools_time_limit <= 0:
+        raise ValueError("Batch size, worker count, and time limit must be positive.")
+    if args.paper_run_root:
+        run_paper_benchmark(args, algorithms)
+        return
 
     dataset = load_npz_to_tensordict(args.data)
     dataset_size = int(dataset.batch_size[0])
@@ -436,15 +605,7 @@ def main() -> None:
     print(f"Instances: {limit}/{dataset_size}")
     print(f"Algorithms: {', '.join(algorithms)}")
 
-    all_rows: list[dict[str, Any]] = []
-    for name in algorithms:
-        print(f"\nRunning {name}...")
-        if name == "nco":
-            rows = evaluate_nco(dataset, limit, args)
-        else:
-            rows = evaluate_algorithm(name, dataset, limit, args)
-        all_rows.extend(rows)
-
+    all_rows = evaluate_algorithms(dataset, limit, args, algorithms)
     write_csv(args.output, all_rows)
     print_summary(all_rows)
     print(f"\nSaved results to: {args.output}")
