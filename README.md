@@ -51,15 +51,30 @@ python evaluate_pc.py --algorithms nco --auto-ckpt --device cpu
 
 `--auto-ckpt` picks the most recently modified best Stage 3 checkpoint. Use `--ckpt` to evaluate a specific run or γ.
 
-## Repository layout
+## Repository Structure
 
-- `run.py` starts the Hydra training job.
-- `generate_pc_datasets.py` creates fixed validation and test data.
-- `evaluate_pc.py` evaluates CPCCD, MCL, and trained NCO policies.
-- `configs/experiment/pc/am_pc_edge.yaml` defines the paper’s training model and batch settings.
-- `rl4co/envs/pc/` implements the environment and instance generator, and `rl4co/models/nn/graph/pc_encoder.py` implements the edge-aware encoder.
-- `baseline/` implements the CP-SAT, CPCCD, and MCL comparators.
-- `data/pc/` holds the validation and test datasets.
+```text
+.
+├── run.py                              # Curriculum training entry point
+├── generate_pc_datasets.py             # Fixed validation and test data generation
+├── evaluate_pc.py                      # CPCCD, MCL, and trained NCO evaluation
+├── configs/
+│   ├── env/pc.yaml                     # PC environment and data settings
+│   └── experiment/pc/am_pc_edge.yaml   # Paper's training configuration
+├── baseline/
+│   ├── cpccd_solver.py                 # CPCCD baseline
+│   ├── mcl_solver.py                   # MCL baseline
+│   ├── ortools_pc_solver.py            # CP-SAT baseline
+│   └── third_party/markov_clustering/  # Vendored MCL code and license
+├── rl4co/
+│   ├── envs/pc/                        # PC environment and instance generator
+│   ├── models/nn/graph/pc_encoder.py   # Edge-aware graph encoder
+│   └── tasks/train.py                  # Curriculum orchestration
+├── tests/                              # Environment, model, and solver tests
+└── data/pc/                            # Generated validation and test datasets
+```
+
+`data/pc/` is generated locally. Training creates `logs/train/curriculum/` for checkpoints and TensorBoard logs.
 
 ## Citation and licensing
 
